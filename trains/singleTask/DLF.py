@@ -6,7 +6,7 @@ from torch import optim
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 from ..utils import MetricsTop, dict_to_str
-from .HingeLoss import HingeLoss
+from .shared_alignment import SharedAlignmentLoss
 
 
 logger = logging.getLogger('MMSA')
@@ -28,7 +28,19 @@ class DLF():
         self.cosine = nn.CosineEmbeddingLoss()
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
-        self.sim_loss = HingeLoss()
+        self.shared_alignment = SharedAlignmentLoss(
+            mode=getattr(args, 'shared_loss_mode', 'original'),
+            atp_weight=getattr(args, 'atp_weight', 0.01),
+            sent_weight=getattr(args, 'sent_weight', 0.01),
+            sent_sigma=getattr(args, 'sent_sigma', 1.0),
+            sent_tau=getattr(args, 'sent_tau', 1.0),
+        )
+        logger.info(
+            "Shared loss: mode=%s, atp_weight=%g, sent_weight=%g, sigma=%g, tau=%g",
+            self.shared_alignment.mode, self.shared_alignment.atp_weight,
+            self.shared_alignment.sent_weight, self.shared_alignment.sent_sigma,
+            self.shared_alignment.sent_tau,
+        )
 
     def do_train(self, model, dataloader, return_epoch_results=False):
 
@@ -61,6 +73,7 @@ class DLF():
               
 
             train_loss = 0.0
+            shared_loss_totals = dict.fromkeys(('atp', 'sent', 'triplet', 'total'), 0.0)
             left_epochs = self.args.update_epochs
             with tqdm(dataloader['train']) as td:
                 for batch_data in td:
@@ -113,22 +126,16 @@ class DLF():
                     
                     loss_ort = cosine_similarity_s_c_l + cosine_similarity_s_c_v + cosine_similarity_s_c_a
 
-                    # triplet margin loss L_m
-                    c_l, c_v, c_a = output['c_l_sim'], output['c_v_sim'], output['c_a_sim']
-                    ids, feats = [], []
-                    for i in range(labels.size(0)):
-                        feats.append(c_l[i].view(1, -1))
-                        feats.append(c_v[i].view(1, -1))
-                        feats.append(c_a[i].view(1, -1))
-                        ids.append(labels[i].view(1, -1))
-                        ids.append(labels[i].view(1, -1))
-                        ids.append(labels[i].view(1, -1))
-                    feats = torch.cat(feats, dim=0)
-                    ids = torch.cat(ids, dim=0)
-                    loss_sim = self.sim_loss(ids, feats)
+                    # Shared-space constraints on the existing projected vectors.
+                    shared_losses = self.shared_alignment(
+                        output['c_l_sim'], output['c_a_sim'], output['c_v_sim'], labels
+                    )
 
-                    #overall loss L_DLF
-                    combined_loss = loss_task + (loss_s_sr + loss_recon + (loss_sim+loss_ort) * 0.1) * 0.1   
+                    # New weights are final coefficients, without an outer 0.1.
+                    combined_loss = (
+                        loss_task + 0.1 * loss_s_sr + 0.1 * loss_recon
+                        + 0.01 * loss_ort + shared_losses['total']
+                    )
                 
                     combined_loss.backward()
 
@@ -139,6 +146,8 @@ class DLF():
                         nn.utils.clip_grad_value_(params, self.args.grad_clip)
 
                     train_loss += combined_loss.item()
+                    for name in shared_loss_totals:
+                        shared_loss_totals[name] += shared_losses[name].detach().item()
                     
 
                     y_pred.append(output['output_logit'].cpu())
@@ -152,6 +161,11 @@ class DLF():
             
 
             train_loss = train_loss / len(dataloader['train'])
+            logger.info(
+                "Shared losses (batch means; total is weighted): %s",
+                dict_to_str({name: value / len(dataloader['train'])
+                             for name, value in shared_loss_totals.items()}),
+            )
             pred, true = torch.cat(y_pred), torch.cat(y_true)
             train_results = self.metrics(pred, true)
             logger.info(
