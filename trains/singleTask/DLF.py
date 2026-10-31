@@ -180,14 +180,16 @@ class DLF():
             cur_valid = val_results[self.args.KeyEval]
             scheduler.step(val_results['Loss'])
             # save each epoch model
-            torch.save(model[0].state_dict(), './pt/' + str(self.args.dataset_name) + '_' + str(epochs) + '.pth')
+            epoch_name = (
+                f"{self.args.dataset_name}{self.args.variant_suffix}_{epochs}.pth"
+            )
+            torch.save(model[0].state_dict(), self.args.model_save_dir / epoch_name)
             # save best model
             isBetter = cur_valid <= (best_valid - 1e-6) if min_or_max == 'min' else cur_valid >= (best_valid + 1e-6)
             if isBetter:
                 best_valid, best_epoch = cur_valid, epochs
                 # save model
-                model_save_path = './pt/DLF' + str(self.args.dataset_name)+'.pth'
-                torch.save(model[0].state_dict(), model_save_path)
+                torch.save(model[0].state_dict(), self.args.checkpoint_path)
 
             if return_epoch_results:
                 train_results["Loss"] = train_loss

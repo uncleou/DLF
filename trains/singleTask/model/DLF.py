@@ -38,6 +38,11 @@ class DLF(nn.Module):
         self.output_dropout = args.output_dropout
         self.text_dropout = args.text_dropout
         self.attn_mask = args.attn_mask
+        self.lfa_mode = getattr(args, 'lfa_mode', 'original')
+        if self.lfa_mode not in {'original', 'selective_null'}:
+            raise ValueError(
+                f"Unknown lfa_mode={self.lfa_mode!r}; expected 'original' or 'selective_null'."
+            )
         combined_dim_low = self.d_a    
         combined_dim_high = self.d_a 
         combined_dim = (self.d_l + self.d_a + self.d_v ) + self.d_l * 3  
@@ -83,8 +88,13 @@ class DLF(nn.Module):
 
 
         # 4 Multimodal Crossmodal Attentions
-        self.trans_l_with_a = self.get_network(self_type='la', layers = self.layers)  
-        self.trans_l_with_v = self.get_network(self_type='lv', layers = self.layers) 
+        use_selective_null = self.lfa_mode == 'selective_null'
+        self.trans_l_with_a = self.get_network(
+            self_type='la', layers=self.layers, selective_null=use_selective_null
+        )
+        self.trans_l_with_v = self.get_network(
+            self_type='lv', layers=self.layers, selective_null=use_selective_null
+        )
         self.trans_a_with_l = self.get_network(self_type='al')
         self.trans_a_with_v = self.get_network(self_type='av')
         self.trans_v_with_l = self.get_network(self_type='vl')
@@ -128,7 +138,7 @@ class DLF(nn.Module):
         self.proj2 = nn.Linear(combined_dim, combined_dim)
         self.out_layer = nn.Linear(combined_dim, output_dim)
         
-    def get_network(self, self_type='l', layers=-1):
+    def get_network(self, self_type='l', layers=-1, selective_null=False):
         if self_type in ['l', 'al', 'vl']:
             embed_dim, attn_dropout = self.d_l, self.attn_dropout
         elif self_type in ['a', 'la', 'va']:
@@ -151,7 +161,8 @@ class DLF(nn.Module):
                                   relu_dropout=self.relu_dropout,
                                   res_dropout=self.res_dropout,
                                   embed_dropout=self.embed_dropout,
-                                  attn_mask=self.attn_mask)
+                                  attn_mask=self.attn_mask,
+                                  selective_null_attn=selective_null)
 
 
     def forward(self, text, audio, video):
@@ -271,6 +282,9 @@ class DLF(nn.Module):
 
         # A --> L
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a) 
+        null_attn_a = None
+        if self.lfa_mode == 'selective_null':
+            null_attn_a = self.trans_l_with_a.layers[-1].self_attn.last_null_attention
         h_as = h_l_with_as
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
@@ -279,6 +293,9 @@ class DLF(nn.Module):
 
         # V --> L
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  
+        null_attn_v = None
+        if self.lfa_mode == 'selective_null':
+            null_attn_v = self.trans_l_with_v.layers[-1].self_attn.last_null_attention
         h_vs = h_l_with_vs
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
@@ -340,6 +357,8 @@ class DLF(nn.Module):
             'logits_v_hetero': logits_v_high, 
             'logits_a_hetero': logits_a_high,
             'logits_c': logits_c,
-            'output_logit': output
+            'output_logit': output,
+            'null_attn_a': null_attn_a,
+            'null_attn_v': null_attn_v
         }
         return res

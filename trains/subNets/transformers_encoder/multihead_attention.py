@@ -9,7 +9,8 @@ class MultiheadAttention(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, attn_dropout=0.,
-                 bias=True, add_bias_kv=False, add_zero_attn=False):
+                 bias=True, add_bias_kv=False, add_zero_attn=False,
+                 add_selective_null=False):
         super().__init__()
         self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -31,6 +32,14 @@ class MultiheadAttention(nn.Module):
             self.bias_k = self.bias_v = None
 
         self.add_zero_attn = add_zero_attn
+        self.add_selective_null = add_selective_null
+        if add_selective_null:
+            # One learnable null key per head. The corresponding value is
+            # constructed as a fixed zero tensor in forward().
+            self.null_key = Parameter(torch.Tensor(num_heads, self.head_dim))
+        else:
+            self.register_parameter('null_key', None)
+        self.last_null_attention = None
 
         self.reset_parameters()
 
@@ -44,6 +53,8 @@ class MultiheadAttention(nn.Module):
             nn.init.xavier_normal_(self.bias_k)
         if self.bias_v is not None:
             nn.init.xavier_normal_(self.bias_v)
+        if self.null_key is not None:
+            nn.init.xavier_normal_(self.null_key)
 
     def forward(self, query, key, value, attn_mask=None):
         """Input shape: Time x Batch x Channel
@@ -96,6 +107,20 @@ class MultiheadAttention(nn.Module):
 
         src_len = k.size(1)
 
+        null_attention_index = None
+        if self.add_selective_null:
+            null_attention_index = src_len
+            null_k = self.null_key.unsqueeze(0).expand(bsz, -1, -1)
+            null_k = null_k.reshape(bsz * self.num_heads, 1, self.head_dim)
+            null_v = v.new_zeros((bsz * self.num_heads, 1, self.head_dim))
+            k = torch.cat([k, null_k], dim=1)
+            v = torch.cat([v, null_v], dim=1)
+            src_len += 1
+            if attn_mask is not None:
+                attn_mask = torch.cat(
+                    [attn_mask, attn_mask.new_zeros(attn_mask.size(0), 1)], dim=1
+                )
+
         if self.add_zero_attn:
             src_len += 1
             k = torch.cat([k, k.new_zeros((k.size(0), 1) + k.size()[2:])], dim=1)
@@ -115,6 +140,13 @@ class MultiheadAttention(nn.Module):
                 assert False
                 
         attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(attn_weights)
+        if self.add_selective_null:
+            null_attention = attn_weights[:, :, null_attention_index]
+            self.last_null_attention = null_attention.view(
+                bsz, self.num_heads, tgt_len
+            ).mean(dim=1)
+        else:
+            self.last_null_attention = None
         # attn_weights = F.relu(attn_weights)
         # attn_weights = attn_weights / torch.max(attn_weights)
         attn_weights = F.dropout(attn_weights, p=self.attn_dropout, training=self.training)

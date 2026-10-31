@@ -168,14 +168,17 @@ class SharedAlignmentTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             SharedAlignmentLoss()(*self.features, self.labels[:2])
 
-    def test_repository_config_enables_new_objective(self):
+    def test_repository_config_defaults_to_original_dlf_objective(self):
         config = json.loads((ROOT / 'config' / 'config.json').read_text())['DLF']
         for dataset in ('mosi', 'mosei'):
             args = dict(config['commonParams'], **config['datasetParams'][dataset])
-            self.assertEqual(args['shared_loss_mode'], 'atp_sent')
+            self.assertEqual(args['shared_loss_mode'], 'original')
             loss = SharedAlignmentLoss(args['shared_loss_mode'], args['atp_weight'],
                                        args['sent_weight'], args['sent_sigma'], args['sent_tau'])
-            self.assertTrue(torch.isfinite(loss(*self.features, self.labels)['total']))
+            result = loss(*self.features, self.labels)
+            self.assertTrue(torch.isfinite(result['total']))
+            self.assertEqual(result['atp'].item(), 0.0)
+            self.assertEqual(result['sent'].item(), 0.0)
 
 
 if __name__ == '__main__':

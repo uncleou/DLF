@@ -90,6 +90,21 @@ def DLF_run(
     args['feature_V'] = feature_V
     if config:
         args.update(config)
+    lfa_mode = getattr(args, 'lfa_mode', 'original')
+    shared_loss_mode = getattr(args, 'shared_loss_mode', 'original')
+    variant_parts = []
+    if shared_loss_mode != 'original':
+        variant_parts.append(shared_loss_mode)
+    if lfa_mode != 'original':
+        variant_parts.append(lfa_mode)
+    variant_suffix = f"_{'_'.join(variant_parts)}" if variant_parts else ''
+    checkpoint_name = (
+        f"DLF{dataset_name}.pth" if not variant_parts
+        else f"DLF{variant_suffix}_{dataset_name}.pth"
+    )
+    args['checkpoint_path'] = Path(model_save_dir) / checkpoint_name
+    args['model_save_dir'] = Path(model_save_dir)
+    args['variant_suffix'] = variant_suffix
 
 
     res_save_dir = Path(res_save_dir) / "normal"
@@ -109,7 +124,8 @@ def DLF_run(
         else:
             df = pd.DataFrame(columns=["Time"]+["Model"] + criterions)
         # save results
-        res = [model_name]
+        result_model_name = f"{model_name}{variant_suffix}"
+        res = [result_model_name]
         for c in criterions:
             values = [r[c] for r in model_results]
             mean = round(np.mean(values)*100, 2)
@@ -183,14 +199,14 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
     #test
     if args.mode == 'test':
-        model.load_state_dict(torch.load('./pt/DLF'+str(args.dataset_name)+'.pth'),strict=False) 
+        model.load_state_dict(torch.load(args.checkpoint_path), strict=False)
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
         sys.stdout.flush()
         input('[Press Any Key to start another run]')
     #train
     else:
         epoch_results = trainer.do_train(model, dataloader, return_epoch_results=from_sena)
-        model[0].load_state_dict(torch.load('./pt/DLF'+str(args.dataset_name)+'.pth'))
+        model[0].load_state_dict(torch.load(args.checkpoint_path))
 
         results = trainer.do_test(model[0], dataloader['test'], mode="TEST")
 
