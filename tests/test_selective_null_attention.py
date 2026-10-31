@@ -66,6 +66,35 @@ class SelectiveNullAttentionTest(unittest.TestCase):
         self.assertEqual(weights.shape, (2, 3, 7))
         torch.testing.assert_close(attention.last_null_attention, weights[:, :, 5])
 
+    def test_force_null_puts_all_mass_on_null_and_uses_zero_value(self):
+        attention = MultiheadAttention(
+            8, 2, attn_dropout=0.0, add_selective_null=True
+        )
+        output, weights = attention(
+            self.query, self.key, self.value, force_null=True
+        )
+        # Null is the last of the 6 key positions.
+        torch.testing.assert_close(
+            weights[:, :, 5], torch.ones_like(weights[:, :, 5])
+        )
+        torch.testing.assert_close(weights[:, :, :5], torch.zeros_like(weights[:, :, :5]))
+        # Null value is a fixed zero tensor, so the projected output is bias-only.
+        self.assertTrue(torch.isfinite(output).all())
+
+    def test_force_null_matches_explicit_null_only_value_aggregation(self):
+        attention = MultiheadAttention(
+            8, 2, attn_dropout=0.0, add_selective_null=True
+        )
+        forced, _ = attention(self.query, self.key, self.value, force_null=True)
+        # With all weight on the zero value, attn = out_proj(0) = out_proj bias/zero.
+        zero_attn = attention.out_proj(torch.zeros_like(forced))
+        torch.testing.assert_close(forced, zero_attn, atol=1e-6, rtol=1e-6)
+
+    def test_force_null_requires_selective_null(self):
+        attention = MultiheadAttention(8, 2, attn_dropout=0.0)
+        with self.assertRaises(ValueError):
+            attention(self.query, self.key, self.value, force_null=True)
+
 
 if __name__ == '__main__':
     unittest.main()

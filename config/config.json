@@ -52,7 +52,14 @@
       "atp_weight": 0.01,
       "sent_weight": 0.01,
       "sent_sigma": 1.0,
-      "sent_tau": 1.0
+      "sent_tau": 1.0,
+      "gain_margin": 0.01,
+      "gain_temperature": 0.1,
+      "gain_confidence_scale": 0.1,
+      "gain_weight": 0.05,
+      "gain_warmup_epochs": 5,
+      "gain_ramp_epochs": 5,
+      "gain_ema_decay": 0.995
     },
     "datasetParams": {
       "mosi": {

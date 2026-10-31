@@ -56,13 +56,17 @@ class MultiheadAttention(nn.Module):
         if self.null_key is not None:
             nn.init.xavier_normal_(self.null_key)
 
-    def forward(self, query, key, value, attn_mask=None):
+    def forward(self, query, key, value, attn_mask=None, force_null=False):
         """Input shape: Time x Batch x Channel
         Self-attention can be implemented by passing in the same arguments for
         query, key and value. Timesteps can be masked by supplying a T x T mask in the
         `attn_mask` argument. Padding elements can be excluded from
         the key by passing a binary ByteTensor (`key_padding_mask`) with shape:
         batch x src_len, where padding elements are indicated by 1s.
+
+        With ``add_selective_null``, ``force_null=True`` blocks every real key so
+        that the attention mass is placed on the Null position only. This is the
+        counterfactual "read nothing from this modality" path.
         """
         qkv_same = query.data_ptr() == key.data_ptr() == value.data_ptr()
         kv_same = key.data_ptr() == value.data_ptr()
@@ -138,7 +142,15 @@ class MultiheadAttention(nn.Module):
                 print(attn_weights.shape)
                 print(attn_mask.unsqueeze(0).shape)
                 assert False
-                
+
+        if force_null:
+            if not self.add_selective_null:
+                raise ValueError("force_null requires add_selective_null=True")
+            # Keep only the Null position finite so softmax assigns it all mass.
+            forced = attn_weights.new_full(attn_weights.size(), float('-inf'))
+            forced[:, :, null_attention_index] = 0.0
+            attn_weights = attn_weights + forced
+
         attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(attn_weights)
         if self.add_selective_null:
             null_attention = attn_weights[:, :, null_attention_index]

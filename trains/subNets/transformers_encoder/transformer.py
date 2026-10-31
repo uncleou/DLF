@@ -46,12 +46,14 @@ class TransformerEncoder(nn.Module):
         if self.normalize:
             self.layer_norm = LayerNorm(embed_dim)
 
-    def forward(self, x_in, x_in_k = None, x_in_v = None):
+    def forward(self, x_in, x_in_k = None, x_in_v = None, force_null=False):
         """
         Args:
             x_in (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
             x_in_k (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
             x_in_v (FloatTensor): embedded input of shape `(src_len, batch, embed_dim)`
+            force_null (bool): if True, cross-attention reads only the Null key
+                (requires the encoder to be built with selective_null_attn=True).
         Returns:
             dict:
                 - **encoder_out** (Tensor): the last encoder layer's output of
@@ -80,9 +82,9 @@ class TransformerEncoder(nn.Module):
         intermediates = [x]
         for layer in self.layers:
             if x_in_k is not None and x_in_v is not None:
-                x = layer(x, x_k, x_v)
+                x = layer(x, x_k, x_v, force_null=force_null)
             else:
-                x = layer(x)
+                x = layer(x, force_null=force_null)
             intermediates.append(x)
 
         if self.normalize:
@@ -132,7 +134,7 @@ class TransformerEncoderLayer(nn.Module):
         self.fc2 = Linear(4*self.embed_dim, self.embed_dim)
         self.layer_norms = nn.ModuleList([LayerNorm(self.embed_dim) for _ in range(2)])  #Define two layer_norms layers
 
-    def forward(self, x, x_k=None, x_v=None):                                     #Two Transformer layers 
+    def forward(self, x, x_k=None, x_v=None, force_null=False):                   #Two Transformer layers
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -140,6 +142,8 @@ class TransformerEncoderLayer(nn.Module):
                 `(batch, src_len)` where padding elements are indicated by ``1``.
             x_k (Tensor): same as x
             x_v (Tensor): same as x
+            force_null (bool): if True, the cross-attention is forced onto the
+                Null position (only meaningful for selective-null encoders).
         Returns:
             encoded output of shape `(batch, src_len, embed_dim)`
         """
@@ -150,8 +154,10 @@ class TransformerEncoderLayer(nn.Module):
             x, _ = self.self_attn(query=x, key=x, value=x, attn_mask=mask)
         else:
             x_k = self.maybe_layer_norm(0, x_k, before=True)
-            x_v = self.maybe_layer_norm(0, x_v, before=True) 
-            x, _ = self.self_attn(query=x, key=x_k, value=x_v, attn_mask=mask)
+            x_v = self.maybe_layer_norm(0, x_v, before=True)
+            x, _ = self.self_attn(
+                query=x, key=x_k, value=x_v, attn_mask=mask, force_null=force_null
+            )
         x = F.dropout(x, p=self.res_dropout, training=self.training)
         x = residual + x
         x = self.maybe_layer_norm(0, x, after=True)                                  #First Transformer layer

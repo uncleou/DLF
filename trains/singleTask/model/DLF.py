@@ -39,9 +39,10 @@ class DLF(nn.Module):
         self.text_dropout = args.text_dropout
         self.attn_mask = args.attn_mask
         self.lfa_mode = getattr(args, 'lfa_mode', 'original')
-        if self.lfa_mode not in {'original', 'selective_null'}:
+        if self.lfa_mode not in {'original', 'selective_null', 'selective_null_gain'}:
             raise ValueError(
-                f"Unknown lfa_mode={self.lfa_mode!r}; expected 'original' or 'selective_null'."
+                f"Unknown lfa_mode={self.lfa_mode!r}; expected 'original', "
+                "'selective_null' or 'selective_null_gain'."
             )
         combined_dim_low = self.d_a    
         combined_dim_high = self.d_a 
@@ -88,7 +89,7 @@ class DLF(nn.Module):
 
 
         # 4 Multimodal Crossmodal Attentions
-        use_selective_null = self.lfa_mode == 'selective_null'
+        use_selective_null = self.lfa_mode in {'selective_null', 'selective_null_gain'}
         self.trans_l_with_a = self.get_network(
             self_type='la', layers=self.layers, selective_null=use_selective_null
         )
@@ -165,7 +166,24 @@ class DLF(nn.Module):
                                   selective_null_attn=selective_null)
 
 
-    def forward(self, text, audio, video):
+    def _high_head(self, last_h, proj1, proj2, out_layer):
+        """Shared high-level head: returns (logits, hs_proj) before fusion."""
+        hs_proj = proj2(
+            F.dropout(F.relu(proj1(last_h), inplace=True),
+                      p=self.output_dropout, training=self.training))
+        hs_proj += last_h
+        return out_layer(hs_proj), hs_proj
+
+    def _fuse_and_predict(self, feat_l, feat_v, feat_a, feat_c):
+        """Fuse the four sigmoid-projected branches and predict sentiment."""
+        last_hs = torch.cat([feat_l, feat_v, feat_a, feat_c], dim=1)
+        last_hs_proj = self.proj2(
+            F.dropout(F.relu(self.proj1(last_hs), inplace=True),
+                      p=self.output_dropout, training=self.training))
+        last_hs_proj += last_hs
+        return self.out_layer(last_hs_proj)
+
+    def forward(self, text, audio, video, return_counterfactual=False):
         #extraction
         if self.use_bert:
             text = self.text_model(text)
@@ -281,58 +299,77 @@ class DLF(nn.Module):
         last_h_l = last_hs = h_ls[-1]  
 
         # A --> L
-        h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a) 
+        h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)
         null_attn_a = None
-        if self.lfa_mode == 'selective_null':
+        if self.lfa_mode in {'selective_null', 'selective_null_gain'}:
             null_attn_a = self.trans_l_with_a.layers[-1].self_attn.last_null_attention
         h_as = h_l_with_as
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
             h_as = h_as[0]
-        last_h_a = last_hs = h_as[-1]  
+        last_h_a = last_hs = h_as[-1]
 
         # V --> L
-        h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)  
+        h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)
         null_attn_v = None
-        if self.lfa_mode == 'selective_null':
+        if self.lfa_mode in {'selective_null', 'selective_null_gain'}:
             null_attn_v = self.trans_l_with_v.layers[-1].self_attn.last_null_attention
         h_vs = h_l_with_vs
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
             h_vs = h_vs[0]
-        last_h_v = last_hs = h_vs[-1]  
+        last_h_v = last_hs = h_vs[-1]
 
 
-        hs_proj_l_high = self.proj2_l_high(
-            F.dropout(F.relu(self.proj1_l_high(last_h_l), inplace=True), p=self.output_dropout, training=self.training))
-        hs_proj_l_high += last_h_l
-        logits_l_high = self.out_layer_l_high(hs_proj_l_high)
+        logits_l_high, hs_proj_l_high = self._high_head(
+            last_h_l, self.proj1_l_high, self.proj2_l_high, self.out_layer_l_high
+        )
+        logits_v_high, hs_proj_v_high = self._high_head(
+            last_h_v, self.proj1_v_high, self.proj2_v_high, self.out_layer_v_high
+        )
+        logits_a_high, hs_proj_a_high = self._high_head(
+            last_h_a, self.proj1_a_high, self.proj2_a_high, self.out_layer_a_high
+        )
 
-        hs_proj_v_high = self.proj2_v_high(
-            F.dropout(F.relu(self.proj1_v_high(last_h_v), inplace=True), p=self.output_dropout, training=self.training))
-        hs_proj_v_high += last_h_v
-        logits_v_high = self.out_layer_v_high(hs_proj_v_high)
-
-        hs_proj_a_high = self.proj2_a_high(
-            F.dropout(F.relu(self.proj1_a_high(last_h_a), inplace=True), p=self.output_dropout,
-                      training=self.training))
-        hs_proj_a_high += last_h_a
-        logits_a_high = self.out_layer_a_high(hs_proj_a_high)
-        
         #fusion
-        last_h_l = torch.sigmoid(self.projector_l(hs_proj_l_high))   
-        last_h_v = torch.sigmoid(self.projector_v(hs_proj_v_high))
-        last_h_a = torch.sigmoid(self.projector_a(hs_proj_a_high))
-        c_fusion = torch.sigmoid(self.projector_c(c_fusion))
-        
-        last_hs = torch.cat([last_h_l, last_h_v, last_h_a, c_fusion], dim=1)   
+        fuse_l = torch.sigmoid(self.projector_l(hs_proj_l_high))
+        fuse_v = torch.sigmoid(self.projector_v(hs_proj_v_high))
+        fuse_a = torch.sigmoid(self.projector_a(hs_proj_a_high))
+        fuse_c = torch.sigmoid(self.projector_c(c_fusion))
 
-        #prediction
-        last_hs_proj = self.proj2(
-            F.dropout(F.relu(self.proj1(last_hs), inplace=True), p=self.output_dropout, training=self.training))
-        last_hs_proj += last_hs                          
+        output = self._fuse_and_predict(fuse_l, fuse_v, fuse_a, fuse_c)
 
-        output = self.out_layer(last_hs_proj)
+        #counterfactual branches (training-only, no extra inference cost)
+        pred_a_null = None
+        pred_v_null = None
+        if return_counterfactual:
+            if self.lfa_mode != 'selective_null_gain':
+                raise ValueError(
+                    "return_counterfactual requires lfa_mode='selective_null_gain'"
+                )
+            # Force only the A->L path to read Null; shared branch unchanged.
+            h_as_null = self.trans_l_with_a(s_l, s_a, s_a, force_null=True)
+            h_as_null = self.trans_a_mem(h_as_null)
+            if type(h_as_null) == tuple:
+                h_as_null = h_as_null[0]
+            last_h_a_null = h_as_null[-1]
+            _, hs_proj_a_null = self._high_head(
+                last_h_a_null, self.proj1_a_high, self.proj2_a_high, self.out_layer_a_high
+            )
+            fuse_a_null = torch.sigmoid(self.projector_a(hs_proj_a_null))
+            pred_a_null = self._fuse_and_predict(fuse_l, fuse_v, fuse_a_null, fuse_c)
+
+            # Force only the V->L path to read Null; shared branch unchanged.
+            h_vs_null = self.trans_l_with_v(s_l, s_v, s_v, force_null=True)
+            h_vs_null = self.trans_v_mem(h_vs_null)
+            if type(h_vs_null) == tuple:
+                h_vs_null = h_vs_null[0]
+            last_h_v_null = h_vs_null[-1]
+            _, hs_proj_v_null = self._high_head(
+                last_h_v_null, self.proj1_v_high, self.proj2_v_high, self.out_layer_v_high
+            )
+            fuse_v_null = torch.sigmoid(self.projector_v(hs_proj_v_null))
+            pred_v_null = self._fuse_and_predict(fuse_l, fuse_v_null, fuse_a, fuse_c)
 
         res = {
             'origin_l': proj_x_l,
@@ -359,6 +396,8 @@ class DLF(nn.Module):
             'logits_c': logits_c,
             'output_logit': output,
             'null_attn_a': null_attn_a,
-            'null_attn_v': null_attn_v
+            'null_attn_v': null_attn_v,
+            'output_logit_a_null': pred_a_null,
+            'output_logit_v_null': pred_v_null
         }
         return res

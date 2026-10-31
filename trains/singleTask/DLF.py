@@ -7,6 +7,9 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from tqdm import tqdm
 from ..utils import MetricsTop, dict_to_str
 from .shared_alignment import SharedAlignmentLoss
+from .gain_supervision import (
+    EMATeacher, GainSupervision, gain_weight_for_epoch, per_sample_smooth_l1,
+)
 
 
 logger = logging.getLogger('MMSA')
@@ -41,6 +44,25 @@ class DLF():
             self.shared_alignment.sent_weight, self.shared_alignment.sent_sigma,
             self.shared_alignment.sent_tau,
         )
+        self.lfa_mode = getattr(args, 'lfa_mode', 'original')
+        self.use_gain = self.lfa_mode == 'selective_null_gain'
+        self.gain_criterion = GainSupervision(
+            margin=getattr(args, 'gain_margin', 0.01),
+            temperature=getattr(args, 'gain_temperature', 0.1),
+            confidence_scale=getattr(args, 'gain_confidence_scale', 0.1),
+        )
+        self.gain_max_weight = getattr(args, 'gain_weight', 0.05)
+        self.gain_warmup = getattr(args, 'gain_warmup_epochs', 5)
+        self.gain_ramp = getattr(args, 'gain_ramp_epochs', 5)
+        self.gain_ema_decay = getattr(args, 'gain_ema_decay', 0.995)
+        if self.use_gain:
+            logger.info(
+                "Gain supervision: margin=%g, tau=%g, scale=%g, lambda_max=%g, "
+                "warmup=%d, ramp=%d, ema=%g",
+                self.gain_criterion.margin, self.gain_criterion.temperature,
+                self.gain_criterion.confidence_scale, self.gain_max_weight,
+                self.gain_warmup, self.gain_ramp, self.gain_ema_decay,
+            )
 
     def do_train(self, model, dataloader, return_epoch_results=False):
 
@@ -62,15 +84,27 @@ class DLF():
 
         net = []
         net_DLF = model[0]
-        net.append(net_DLF)    
+        net.append(net_DLF)
         model = net
-        
+
+        # EMA teacher for stable per-sample gain labels (training-only).
+        teacher = None
+        if self.use_gain:
+            teacher = EMATeacher(model[0], decay=self.gain_ema_decay).to(self.args.device)
+
+        gain_totals = {'gain_a': 0.0, 'gain_v': 0.0, 'loss_gain': 0.0}
+
         while True:
             epochs += 1
             y_pred, y_true = [], []
             for mod in model:
                 mod.train()
-              
+
+            gain_weight = (
+                gain_weight_for_epoch(
+                    epochs, self.gain_warmup, self.gain_ramp, self.gain_max_weight
+                ) if self.use_gain else 0.0
+            )
 
             train_loss = 0.0
             shared_loss_totals = dict.fromkeys(('atp', 'sent', 'triplet', 'total'), 0.0)
@@ -136,7 +170,35 @@ class DLF():
                         loss_task + 0.1 * loss_s_sr + 0.1 * loss_recon
                         + 0.01 * loss_ort + shared_losses['total']
                     )
-                
+
+                    # Gain supervision: EMA teacher labels how much each
+                    # cross-modal path helps; student's gate is trained toward it.
+                    loss_gain = None
+                    if self.use_gain:
+                        with torch.no_grad():
+                            teacher_out = teacher.module(
+                                text, audio, vision, return_counterfactual=True
+                            )
+                            e_full = per_sample_smooth_l1(
+                                teacher_out['output_logit'], labels
+                            )
+                            e_a_null = per_sample_smooth_l1(
+                                teacher_out['output_logit_a_null'], labels
+                            )
+                            e_v_null = per_sample_smooth_l1(
+                                teacher_out['output_logit_v_null'], labels
+                            )
+                            gain_a = (e_a_null - e_full).squeeze(-1)
+                            gain_v = (e_v_null - e_full).squeeze(-1)
+                        gain_losses = self.gain_criterion(
+                            output['null_attn_a'].mean(dim=-1),
+                            output['null_attn_v'].mean(dim=-1),
+                            gain_a, gain_v,
+                        )
+                        loss_gain = gain_losses['total']
+                        if gain_weight > 0:
+                            combined_loss = combined_loss + gain_weight * loss_gain
+
                     combined_loss.backward()
 
 
@@ -148,17 +210,26 @@ class DLF():
                     train_loss += combined_loss.item()
                     for name in shared_loss_totals:
                         shared_loss_totals[name] += shared_losses[name].detach().item()
-                    
+
+                    if self.use_gain:
+                        with torch.no_grad():
+                            gain_totals['gain_a'] += gain_a.mean().item()
+                            gain_totals['gain_v'] += gain_v.mean().item()
+                            gain_totals['loss_gain'] += loss_gain.item()
 
                     y_pred.append(output['output_logit'].cpu())
                     y_true.append(labels.cpu())
                     if not left_epochs:
                         optimizer.step()
                         left_epochs = self.args.update_epochs
+                        if teacher is not None:
+                            teacher.update(model[0])
                 if not left_epochs:
                     # update
                     optimizer.step()
-            
+                    if teacher is not None:
+                        teacher.update(model[0])
+
 
             train_loss = train_loss / len(dataloader['train'])
             logger.info(
@@ -166,6 +237,15 @@ class DLF():
                 dict_to_str({name: value / len(dataloader['train'])
                              for name, value in shared_loss_totals.items()}),
             )
+            if self.use_gain:
+                num_batches = len(dataloader['train'])
+                logger.info(
+                    "Gain supervision (batch means): lambda=%.4f %s",
+                    gain_weight,
+                    dict_to_str({name: value / num_batches
+                                 for name, value in gain_totals.items()}),
+                )
+                gain_totals = {'gain_a': 0.0, 'gain_v': 0.0, 'loss_gain': 0.0}
             pred, true = torch.cat(y_pred), torch.cat(y_true)
             train_results = self.metrics(pred, true)
             logger.info(
