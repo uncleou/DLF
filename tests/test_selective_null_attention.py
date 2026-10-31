@@ -1,5 +1,6 @@
 """Unit tests for the optional selective-null attention path."""
 
+import importlib
 import importlib.util
 from pathlib import Path
 import unittest
@@ -94,6 +95,68 @@ class SelectiveNullAttentionTest(unittest.TestCase):
         attention = MultiheadAttention(8, 2, attn_dropout=0.0)
         with self.assertRaises(ValueError):
             attention(self.query, self.key, self.value, force_null=True)
+
+    def test_null_bias_is_zero_and_learnable_by_default(self):
+        attention = MultiheadAttention(
+            8, 2, attn_dropout=0.0, add_selective_null=True
+        )
+        self.assertTrue(attention.null_gate_open)
+        self.assertTrue(attention.null_bias.requires_grad)
+        torch.testing.assert_close(attention.null_bias, torch.zeros(2))
+
+    def test_closed_gate_zeroes_null_attention_and_freezes_parameters(self):
+        attention = MultiheadAttention(
+            8, 2, attn_dropout=0.0, add_selective_null=True
+        )
+        attention.set_null_gate_open(False)
+        self.assertFalse(attention.null_gate_open)
+        self.assertFalse(attention.null_bias.requires_grad)
+        self.assertFalse(attention.null_key.requires_grad)
+        _, weights = attention(self.query, self.key, self.value)
+        # Null column is the last key position.
+        self.assertLess(weights[:, :, 5].max().item(), 1e-6)
+
+    def test_reopening_gate_resets_bias_and_unfreezes(self):
+        attention = MultiheadAttention(
+            8, 2, attn_dropout=0.0, add_selective_null=True
+        )
+        attention.set_null_gate_open(False)
+        attention.set_null_gate_open(True)
+        self.assertTrue(attention.null_gate_open)
+        self.assertTrue(attention.null_bias.requires_grad)
+        self.assertTrue(attention.null_key.requires_grad)
+        torch.testing.assert_close(attention.null_bias, torch.zeros(2))
+
+    def test_encoder_adds_null_only_to_last_layer(self):
+        import sys
+        import types
+        root = Path(__file__).parents[1]
+        pkg_name = '_dlf_encoder_tests'
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = [str(root / 'trains/subNets/transformers_encoder')]
+            sys.modules[pkg_name] = pkg
+        mod = importlib.import_module(pkg_name + '.transformer')
+        enc = mod.TransformerEncoder(8, 2, layers=3, selective_null_attn=True)
+        has_null = [layer.self_attn.add_selective_null for layer in enc.layers]
+        self.assertEqual(has_null, [False, False, True])
+
+    def test_encoder_can_add_null_to_all_layers(self):
+        import sys
+        import types
+        root = Path(__file__).parents[1]
+        pkg_name = '_dlf_encoder_tests2'
+        if pkg_name not in sys.modules:
+            pkg = types.ModuleType(pkg_name)
+            pkg.__path__ = [str(root / 'trains/subNets/transformers_encoder')]
+            sys.modules[pkg_name] = pkg
+        mod = importlib.import_module(pkg_name + '.transformer')
+        enc = mod.TransformerEncoder(
+            8, 2, layers=3, selective_null_attn=True,
+            selective_null_last_only=False
+        )
+        has_null = [layer.self_attn.add_selective_null for layer in enc.layers]
+        self.assertEqual(has_null, [True, True, True])
 
 
 if __name__ == '__main__':

@@ -165,6 +165,13 @@ class DLF(nn.Module):
                                   attn_mask=self.attn_mask,
                                   selective_null_attn=selective_null)
 
+    def set_null_gate_open(self, is_open, closed_bias=-1e4):
+        """Open/close the selective-null gate on the A->L and V->L encoders."""
+        if self.lfa_mode not in {'selective_null', 'selective_null_gain'}:
+            return
+        self.trans_l_with_a.set_null_gate_open(is_open, closed_bias)
+        self.trans_l_with_v.set_null_gate_open(is_open, closed_bias)
+
 
     def _high_head(self, last_h, proj1, proj2, out_layer):
         """Shared high-level head: returns (logits, hs_proj) before fusion."""

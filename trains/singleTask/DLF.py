@@ -46,6 +46,10 @@ class DLF():
         )
         self.lfa_mode = getattr(args, 'lfa_mode', 'original')
         self.use_gain = self.lfa_mode == 'selective_null_gain'
+        self.use_null = self.lfa_mode in {'selective_null', 'selective_null_gain'}
+        # Null gate is held closed for this many epochs, then released.
+        self.null_warmup_epochs = getattr(args, 'null_warmup_epochs', 5)
+        self._null_gate_open = None
         self.gain_criterion = GainSupervision(
             margin=getattr(args, 'gain_margin', 0.01),
             temperature=getattr(args, 'gain_temperature', 0.1),
@@ -105,6 +109,19 @@ class DLF():
                     epochs, self.gain_warmup, self.gain_ramp, self.gain_max_weight
                 ) if self.use_gain else 0.0
             )
+
+            # Null gate warm-up: closed for the first `null_warmup_epochs`,
+            # then released so it can learn normally.
+            if self.use_null:
+                gate_open = epochs > self.null_warmup_epochs
+                if gate_open != self._null_gate_open:
+                    model[0].set_null_gate_open(gate_open)
+                    self._null_gate_open = gate_open
+                    logger.info(
+                        "Null gate %s at epoch %d (warmup=%d)",
+                        "opened" if gate_open else "closed", epochs,
+                        self.null_warmup_epochs,
+                    )
 
             train_loss = 0.0
             shared_loss_totals = dict.fromkeys(('atp', 'sent', 'triplet', 'total'), 0.0)

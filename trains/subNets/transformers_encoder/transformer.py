@@ -20,25 +20,31 @@ class TransformerEncoder(nn.Module):
     """
 
     def __init__(self, embed_dim, num_heads, layers, attn_dropout=0.0, relu_dropout=0.0, res_dropout=0.0,
-                 embed_dropout=0.0, attn_mask=False, selective_null_attn=False):
+                 embed_dropout=0.0, attn_mask=False, selective_null_attn=False,
+                 selective_null_last_only=True):
         super().__init__()
         self.dropout = embed_dropout      # Embedding dropout
         self.attn_dropout = attn_dropout
         self.embed_dim = embed_dim
         self.embed_scale = math.sqrt(embed_dim)
         self.embed_positions = SinusoidalPositionalEmbedding(embed_dim)
-        
+
         self.attn_mask = attn_mask
 
         self.layers = nn.ModuleList([])     #define multiple transformer layers
         for layer in range(layers):
+            # By default the Null key is only added to the last layer so the
+            # gate acts on the final cross-modal read, not on every layer.
+            layer_selective_null = selective_null_attn and (
+                not selective_null_last_only or layer == layers - 1
+            )
             new_layer = TransformerEncoderLayer(embed_dim,
                                                 num_heads=num_heads,
                                                 attn_dropout=attn_dropout,
                                                 relu_dropout=relu_dropout,
                                                 res_dropout=res_dropout,
                                                 attn_mask=attn_mask,
-                                                selective_null_attn=selective_null_attn)
+                                                selective_null_attn=layer_selective_null)
             self.layers.append(new_layer)
 
         self.register_buffer('version', torch.Tensor([2]))
@@ -98,6 +104,11 @@ class TransformerEncoder(nn.Module):
             return self.max_source_positions
         return min(self.max_source_positions, self.embed_positions.max_positions())
 
+    def set_null_gate_open(self, is_open, closed_bias=-1e4):
+        """Open/close the selective-null gate on every layer that has one."""
+        for layer in self.layers:
+            layer.self_attn.set_null_gate_open(is_open, closed_bias)
+
 
 class TransformerEncoderLayer(nn.Module):
     """Encoder layer block.
@@ -155,8 +166,12 @@ class TransformerEncoderLayer(nn.Module):
         else:
             x_k = self.maybe_layer_norm(0, x_k, before=True)
             x_v = self.maybe_layer_norm(0, x_v, before=True)
+            # Only the layer that owns a Null key can be forced onto it; other
+            # layers run normal cross-attention so the counterfactual path stays
+            # consistent with the last-layer-only gate.
             x, _ = self.self_attn(
-                query=x, key=x_k, value=x_v, attn_mask=mask, force_null=force_null
+                query=x, key=x_k, value=x_v, attn_mask=mask,
+                force_null=force_null and self.self_attn.add_selective_null,
             )
         x = F.dropout(x, p=self.res_dropout, training=self.training)
         x = residual + x

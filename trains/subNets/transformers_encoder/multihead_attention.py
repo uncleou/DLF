@@ -37,8 +37,15 @@ class MultiheadAttention(nn.Module):
             # One learnable null key per head. The corresponding value is
             # constructed as a fixed zero tensor in forward().
             self.null_key = Parameter(torch.Tensor(num_heads, self.head_dim))
+            # Per-head logit bias on the Null position. A very negative value
+            # keeps the gate closed during warm-up; set_null_gate_open releases
+            # it so the gate can learn normally.
+            self.null_bias = Parameter(torch.zeros(num_heads))
+            self.null_gate_open = True
         else:
             self.register_parameter('null_key', None)
+            self.register_parameter('null_bias', None)
+            self.null_gate_open = True
         self.last_null_attention = None
 
         self.reset_parameters()
@@ -143,6 +150,12 @@ class MultiheadAttention(nn.Module):
                 print(attn_mask.unsqueeze(0).shape)
                 assert False
 
+        if self.add_selective_null:
+            # Broadcast the per-head bias onto the Null column:
+            # [bsz*heads, tgt, src] with heads ordered as bsz-major.
+            bias = self.null_bias.repeat(bsz).view(bsz * self.num_heads, 1)
+            attn_weights[:, :, null_attention_index] += bias
+
         if force_null:
             if not self.add_selective_null:
                 raise ValueError("force_null requires add_selective_null=True")
@@ -173,6 +186,22 @@ class MultiheadAttention(nn.Module):
         attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len, src_len)
         attn_weights = attn_weights.sum(dim=1) / self.num_heads
         return attn, attn_weights
+
+    def set_null_gate_open(self, is_open, closed_bias=-30.0):
+        """Open/close the Null gate without changing parameter shapes.
+
+        Closed (warm-up): ``null_bias`` is pushed to ``closed_bias`` so the Null
+        probability is ~0 (gate off), and both the Null key and bias are frozen.
+        Open: the bias is reset to 0 and both parameters become learnable again,
+        so the gate starts from a neutral point and learns normally.
+        """
+        if not self.add_selective_null:
+            return
+        self.null_gate_open = is_open
+        with torch.no_grad():
+            self.null_bias.fill_(0.0 if is_open else closed_bias)
+        self.null_bias.requires_grad_(is_open)
+        self.null_key.requires_grad_(is_open)
 
     def in_proj_qkv(self, query):
         return self._in_proj(query).chunk(3, dim=-1)
