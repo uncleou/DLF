@@ -32,13 +32,16 @@ class TransformerEncoder(nn.Module):
 
         self.layers = nn.ModuleList([])     #define multiple transformer layers
         for layer in range(layers):
+            # The selective-null key is only added to the last layer, so the
+            # gate acts on the final cross-modal read.
+            layer_selective_null = selective_null_attn and layer == layers - 1
             new_layer = TransformerEncoderLayer(embed_dim,
                                                 num_heads=num_heads,
                                                 attn_dropout=attn_dropout,
                                                 relu_dropout=relu_dropout,
                                                 res_dropout=res_dropout,
                                                 attn_mask=attn_mask,
-                                                selective_null_attn=selective_null_attn)
+                                                selective_null_attn=layer_selective_null)
             self.layers.append(new_layer)
 
         self.register_buffer('version', torch.Tensor([2]))
@@ -160,8 +163,12 @@ class TransformerEncoderLayer(nn.Module):
         else:
             x_k = self.maybe_layer_norm(0, x_k, before=True)
             x_v = self.maybe_layer_norm(0, x_v, before=True)
+            # Only the layer that owns a Null key can be forced onto it; other
+            # layers run normal cross-attention so the counterfactual path stays
+            # consistent with the last-layer-only gate.
             x, _ = self.self_attn(
-                query=x, key=x_k, value=x_v, attn_mask=mask, force_null=force_null
+                query=x, key=x_k, value=x_v, attn_mask=mask,
+                force_null=force_null and self.self_attn.add_selective_null,
             )
         x = F.dropout(x, p=self.res_dropout, training=self.training)
         x = residual + x

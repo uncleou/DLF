@@ -127,7 +127,7 @@ class SelectiveNullAttentionTest(unittest.TestCase):
         self.assertTrue(attention.null_key.requires_grad)
         torch.testing.assert_close(attention.null_bias, torch.zeros(2))
 
-    def test_encoder_adds_null_to_all_layers(self):
+    def test_encoder_adds_null_only_to_last_layer(self):
         import sys
         import types
         root = Path(__file__).parents[1]
@@ -139,7 +139,7 @@ class SelectiveNullAttentionTest(unittest.TestCase):
         mod = importlib.import_module(pkg_name + '.transformer')
         enc = mod.TransformerEncoder(8, 2, layers=3, selective_null_attn=True)
         has_null = [layer.self_attn.add_selective_null for layer in enc.layers]
-        self.assertEqual(has_null, [True, True, True])
+        self.assertEqual(has_null, [False, False, True])
 
     def test_encoder_without_null_has_none(self):
         import sys
