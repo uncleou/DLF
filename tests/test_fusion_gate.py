@@ -40,6 +40,8 @@ def _load_model_module():
     trains.__path__ = [str(ROOT / 'trains')]
     single = types.ModuleType('trains.singleTask')
     single.__path__ = [str(ROOT / 'trains' / 'singleTask')]
+    model_pkg = types.ModuleType('trains.singleTask.model')
+    model_pkg.__path__ = [str(ROOT / 'trains' / 'singleTask' / 'model')]
     subnets = types.ModuleType('trains.subNets')
     subnets.__path__ = []
     subnets.BertTextEncoder = _StubBert
@@ -51,15 +53,21 @@ def _load_model_module():
     transformer_mod.TransformerEncoder = _StubTransformer
     for name, mod in (
         ('trains', trains), ('trains.singleTask', single),
+        ('trains.singleTask.model', model_pkg),
         ('trains.subNets', subnets),
         ('trains.subNets.transformers_encoder', transformer_pkg),
         ('trains.subNets.transformers_encoder.transformer', transformer_mod),
     ):
         sys.modules[name] = mod
 
+    # Load as a real submodule so the `from ...subNets import ...` relative
+    # imports in DLF.py resolve against the stubbed package hierarchy.
     path = ROOT / 'trains' / 'singleTask' / 'model' / 'DLF.py'
-    spec = importlib.util.spec_from_file_location('dlf_gate_model', path)
+    spec = importlib.util.spec_from_file_location(
+        'trains.singleTask.model.DLF', path
+    )
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -70,7 +78,9 @@ def _make_args(mode):
         dst_feature_dim_nheads=(8, 2),
         dataset_name='mosi',
         need_data_aligned=True,
-        feature_dims=(16, 8, 8),
+        # orig dims must differ from dst (8) so the Conv1d projections run and
+        # shorten the sequence from 50 to 46, matching the align_* layers.
+        feature_dims=(16, 9, 9),
         nlevels=1,
         attn_dropout=0.0, attn_dropout_a=0.0, attn_dropout_v=0.0,
         relu_dropout=0.0, embed_dropout=0.0, res_dropout=0.0,
@@ -158,8 +168,8 @@ class FusionGateTest(unittest.TestCase):
         model = self._model('sample')
         model.train()
         text = torch.randn(2, 50, 16)
-        audio = torch.randn(2, 50, 8)
-        video = torch.randn(2, 50, 8)
+        audio = torch.randn(2, 50, 9)
+        video = torch.randn(2, 50, 9)
         out = model(text, audio, video)
         self.assertEqual(out['fusion_gate_a'].shape, (2, 1))
         self.assertEqual(out['fusion_gate_v'].shape, (2, 1))
@@ -168,8 +178,8 @@ class FusionGateTest(unittest.TestCase):
 
     def test_forward_none_has_no_gate_output(self):
         model = self._model('none')
-        out = model(torch.randn(2, 50, 16), torch.randn(2, 50, 8),
-                    torch.randn(2, 50, 8))
+        out = model(torch.randn(2, 50, 16), torch.randn(2, 50, 9),
+                    torch.randn(2, 50, 9))
         self.assertIsNone(out['fusion_gate_a'])
         self.assertIsNone(out['fusion_gate_v'])
 
