@@ -6,7 +6,7 @@
 
 - `original`：原始交叉注意力，默认模式；
 - `selective_null`：仅在 A→L 和 V→L 路径增加可学习空 Key，空 Value 固定为零；
-  空 Key 只加在**最后一层**，并带 per-head `null_bias` 与 warm-up 门控；
+  空 Key 加在**所有层**，并带 per-head `null_bias` 与 warm-up 门控；
 - `selective_null_gain`：在 `selective_null` 基础上加入逐样本收益监督（EMA Teacher）。
 
 ```bash
@@ -22,10 +22,11 @@ python train.py --dataset mosi --lfa-mode selective_null_gain
 已有的 ATP/SENT 实现仍然保留。例如 `--shared-loss-mode atp_sent` 可运行
 ATP_SENT 消融，其 checkpoint 会带有相应后缀，不会覆盖上述主实验。
 
-## 空读取的最后一层 + warm-up
+## 空读取的所有层 + warm-up
 
-`selective_null` 的空 Key 只注入 A→L 和 V→L 的**最后一层**交叉注意力，
-门控作用于最终的跨模态读取，而非每一层。
+`selective_null` 的空 Key 注入 A→L 和 V→L 的**每一层**交叉注意力，
+每一层的 Null 位置都有独立的 per-head `null_bias`。`null_attn_a/v` 报告的是
+最后一层的空读取概率。
 
 `null_bias`（per-head）控制 Null 位置的 logit 偏置，训练器按 epoch 控制门控：
 
