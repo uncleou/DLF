@@ -93,6 +93,8 @@ def DLF_run(
     lfa_mode = getattr(args, 'lfa_mode', 'original')
     shared_loss_mode = getattr(args, 'shared_loss_mode', 'original')
     fusion_gate_mode = getattr(args, 'fusion_gate_mode', 'none')
+    lfa_pool_mode = getattr(args, 'lfa_pool_mode', 'last')
+    lfa_pool_paths = sorted(getattr(args, 'lfa_pool_paths', []) or [])
     variant_parts = []
     if shared_loss_mode != 'original':
         variant_parts.append(shared_loss_mode)
@@ -100,6 +102,11 @@ def DLF_run(
         variant_parts.append(lfa_mode)
     if fusion_gate_mode != 'none':
         variant_parts.append(fusion_gate_mode)
+    if lfa_pool_mode != 'last':
+        suffix = f"pool{lfa_pool_mode}"
+        if lfa_pool_paths:
+            suffix += '-' + '+'.join(lfa_pool_paths)
+        variant_parts.append(suffix)
     variant_suffix = f"_{'_'.join(variant_parts)}" if variant_parts else ''
     checkpoint_name = (
         f"DLF{dataset_name}.pth" if not variant_parts

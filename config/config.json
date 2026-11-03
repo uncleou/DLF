@@ -46,6 +46,8 @@
       "use_bert": true,
       "use_finetune": true,
       "lfa_mode": "original",
+      "lfa_pool_mode": "last",
+      "lfa_pool_paths": [],
       "fusion_gate_mode": "none",
       "fusion_gate_init": 0.9,
       "attn_mask": true,

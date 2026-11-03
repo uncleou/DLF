@@ -58,6 +58,24 @@ class DLF(nn.Module):
                 f"fusion_gate_init must be in (0, 1), got {self.fusion_gate_init}."
             )
         gate_bias = math.log(self.fusion_gate_init / (1.0 - self.fusion_gate_init))
+
+        # LFA sequence pooling: replaces the [-1] summarize on the private LFA
+        # paths. 'last' reproduces the original model byte-for-byte.
+        self.lfa_pool_mode = getattr(args, 'lfa_pool_mode', 'last')
+        if self.lfa_pool_mode not in {'last', 'mean', 'attn'}:
+            raise ValueError(
+                f"Unknown lfa_pool_mode={self.lfa_pool_mode!r}; expected "
+                "'last', 'mean' or 'attn'."
+            )
+        raw_paths = getattr(args, 'lfa_pool_paths', []) or []
+        invalid_paths = set(raw_paths) - {'text', 'audio', 'video'}
+        if invalid_paths:
+            raise ValueError(
+                f"Unknown lfa_pool_paths={sorted(invalid_paths)!r}; expected a "
+                "subset of {'text', 'audio', 'video'}."
+            )
+        self.lfa_pool_paths = set(raw_paths)
+        self.conv1d_kernel_size_l = args.conv1d_kernel_size_l
         combined_dim_low = self.d_a
         combined_dim_high = self.d_a 
         combined_dim = (self.d_l + self.d_a + self.d_v ) + self.d_l * 3  
@@ -163,6 +181,16 @@ class DLF(nn.Module):
             self.gate_a_global = nn.Parameter(torch.tensor(gate_bias))
             self.gate_v_global = nn.Parameter(torch.tensor(gate_bias))
 
+        # 7c. attention-pool scorers for the selected LFA private paths
+        self.lfa_attn = nn.ModuleDict()
+        if self.lfa_pool_mode == 'attn':
+            if 'text' in self.lfa_pool_paths:
+                self.lfa_attn['text'] = self._make_attn_pool(self.d_l)
+            if 'audio' in self.lfa_pool_paths:
+                self.lfa_attn['audio'] = self._make_attn_pool(self.d_a)
+            if 'video' in self.lfa_pool_paths:
+                self.lfa_attn['video'] = self._make_attn_pool(self.d_v)
+
         # 8. final project
         self.proj1 = nn.Linear(combined_dim, combined_dim)
         self.proj2 = nn.Linear(combined_dim, combined_dim)
@@ -210,6 +238,70 @@ class DLF(nn.Module):
         hs_proj += last_h
         return out_layer(hs_proj), hs_proj
 
+    @staticmethod
+    def _make_attn_pool(dim):
+        """Additive attention scorer: e_t = v^T tanh(W h_t + b)."""
+        return nn.Sequential(nn.Linear(dim, dim), nn.Tanh(), nn.Linear(dim, 1))
+
+    def _build_lfa_mask(self, text):
+        """Build a [B, T'] validity mask on the private LFA time axis.
+
+        All three LFA paths are indexed by text positions (query = s_l, length
+        len_l - kernel + 1). Valid tokens are taken from the BERT input mask
+        when present, otherwise inferred from non-zero rows, then aligned to the
+        conv1d output length with a stride-1 max-pool (any real token in the
+        receptive field marks the position valid).
+        """
+        if self.use_bert and text.dim() == 3 and text.size(1) >= 2:
+            token_mask = text[:, 1, :].float()  # (B, len_l)
+        else:
+            token_mask = (text.abs().sum(dim=-1) > 0).float()
+        if token_mask.dim() == 1:
+            token_mask = token_mask.unsqueeze(0)
+        pooled = F.max_pool1d(
+            token_mask.unsqueeze(1),
+            kernel_size=self.conv1d_kernel_size_l,
+            stride=1,
+        ).squeeze(1)
+        return pooled > 0.5  # (B, T') bool
+
+    def _lfa_pool(self, h, path_key, mask):
+        """Summarize an LFA path over time: last (original) / mean / attn.
+
+        `h` is (T, B, D); `mask` is (B, T) or None. Only the selected paths
+        deviate from the original last-position read.
+        """
+        if self.lfa_pool_mode == 'last' or path_key not in self.lfa_pool_paths:
+            return h[-1]
+
+        hm = h.transpose(0, 1)  # (B, T, D)
+        if mask is None:
+            valid = torch.ones(hm.size(0), hm.size(1), dtype=torch.bool, device=hm.device)
+        else:
+            valid = mask
+            if valid.size(1) != hm.size(1):
+                raise ValueError(
+                    f"LFA mask length {valid.size(1)} != sequence length {hm.size(1)} "
+                    f"for path {path_key!r}."
+                )
+        valid_f = valid.unsqueeze(-1).to(hm.dtype)  # (B, T, 1)
+
+        if self.lfa_pool_mode == 'mean':
+            denom = valid_f.sum(dim=1).clamp_min(1.0)  # (B, 1)
+            pooled = (hm * valid_f).sum(dim=1) / denom
+            has_valid = valid.any(dim=1, keepdim=True)
+            return torch.where(has_valid, pooled, h[-1])
+
+        # attn
+        scores = self.lfa_attn[path_key](hm).squeeze(-1)  # (B, T)
+        scores = scores.masked_fill(~valid, float('-inf'))
+        has_valid = valid.any(dim=1, keepdim=True)
+        # If a row has no valid position, fall back to the last position.
+        scores = torch.where(has_valid, scores, torch.zeros_like(scores))
+        weights = torch.softmax(scores, dim=1)  # (B, T)
+        pooled = (weights.unsqueeze(-1) * hm).sum(dim=1)
+        return torch.where(has_valid, pooled, h[-1])
+
     def _gate_audio(self, h_l, h_a):
         """Scalar audio gate with shape [B, 1], or None when gates are disabled."""
         if self.fusion_gate_mode == 'none':
@@ -243,9 +335,12 @@ class DLF(nn.Module):
 
     def forward(self, text, audio, video, return_counterfactual=False):
         #extraction
+        lfa_mask = None
+        if self.lfa_pool_mode != 'last':
+            lfa_mask = self._build_lfa_mask(text)
         if self.use_bert:
             text = self.text_model(text)
-        x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training) 
+        x_l = F.dropout(text.transpose(1, 2), p=self.text_dropout, training=self.training)
         x_a = audio.transpose(1, 2)
         x_v = video.transpose(1, 2)
         
@@ -349,12 +444,12 @@ class DLF(nn.Module):
         logits_c = self.out_layer_c(c_proj)     
         
         # LFA
-        # L --> L                
-        h_ls = s_l                     
-        h_ls = self.trans_l_mem(h_ls)  
+        # L --> L
+        h_ls = s_l
+        h_ls = self.trans_l_mem(h_ls)
         if type(h_ls) == tuple:
             h_ls = h_ls[0]
-        last_h_l = last_hs = h_ls[-1]  
+        last_h_l = last_hs = self._lfa_pool(h_ls, 'text', lfa_mask)
 
         # A --> L
         h_l_with_as = self.trans_l_with_a(s_l, s_a, s_a)
@@ -365,7 +460,7 @@ class DLF(nn.Module):
         h_as = self.trans_a_mem(h_as)
         if type(h_as) == tuple:
             h_as = h_as[0]
-        last_h_a = last_hs = h_as[-1]
+        last_h_a = last_hs = self._lfa_pool(h_as, 'audio', lfa_mask)
 
         # V --> L
         h_l_with_vs = self.trans_l_with_v(s_l, s_v, s_v)
@@ -376,7 +471,7 @@ class DLF(nn.Module):
         h_vs = self.trans_v_mem(h_vs)
         if type(h_vs) == tuple:
             h_vs = h_vs[0]
-        last_h_v = last_hs = h_vs[-1]
+        last_h_v = last_hs = self._lfa_pool(h_vs, 'video', lfa_mask)
 
 
         logits_l_high, hs_proj_l_high = self._high_head(
@@ -416,7 +511,7 @@ class DLF(nn.Module):
             h_as_null = self.trans_a_mem(h_as_null)
             if type(h_as_null) == tuple:
                 h_as_null = h_as_null[0]
-            last_h_a_null = h_as_null[-1]
+            last_h_a_null = self._lfa_pool(h_as_null, 'audio', lfa_mask)
             _, hs_proj_a_null = self._high_head(
                 last_h_a_null, self.proj1_a_high, self.proj2_a_high, self.out_layer_a_high
             )
@@ -431,7 +526,7 @@ class DLF(nn.Module):
             h_vs_null = self.trans_v_mem(h_vs_null)
             if type(h_vs_null) == tuple:
                 h_vs_null = h_vs_null[0]
-            last_h_v_null = h_vs_null[-1]
+            last_h_v_null = self._lfa_pool(h_vs_null, 'video', lfa_mask)
             _, hs_proj_v_null = self._high_head(
                 last_h_v_null, self.proj1_v_high, self.proj2_v_high, self.out_layer_v_high
             )
