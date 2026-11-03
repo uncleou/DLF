@@ -80,3 +80,37 @@ ATP_SENT 消融，其 checkpoint 会带有相应后缀，不会覆盖上述主�
 可额外统计：有益/有害样本的平均空读取率、`Δ>0` 与 `Δ<0` 两组的性能、
 音频与视频分别被拒绝的比例。三组均从头训练，并保持数据、种子、原始 HingeLoss、
 训练预算和验证集选模规则相同。
+
+## 融合门控（`fusion_gate_mode`）
+
+在最终融合前对 A、V 两条路径各加一个样本级标量门控，文本路径与共享路径不加门：
+
+\[
+z_{\rm gate}=[u_L;\ g_V u_V;\ g_A u_A;\ c],\qquad
+g_A=\sigma(w_A^\top[h_L;h_A]+b_A),\quad
+g_V=\sigma(w_V^\top[h_L;h_V]+b_V)
+\]
+
+`u_A,u_V` 是 LFA 之后的文本引导交互结果（`t` 在 sigmoid 投影之后）；`h_L,h_A,h_V`
+用融合前的 `hs_proj_*_high`（维度 d=50，拼接 100 维），新增参数 `4d+2`。门控与
+`lfa_mode` 正交，可与 `selective_null` / `selective_null_gain` 组合；组合时反事实
+分支也乘同一门控。
+
+`fusion_gate_mode` 四选一（config 键，默认 `none`）：
+
+- `none`：不启用，现有三版行为逐位不变；
+- `fixed`：`g_A=g_V=fusion_gate_init`（默认 0.9）常数，用于检查“仅是缩小特征”的对照；
+- `global`：两个全局可学习标量（2 个参数），检查是否需要逐样本；
+- `sample`：逐样本两个门（`4d+2` 个参数），weight 置零、bias 取 σ⁻¹(0.9)，
+  训练起点与 `fixed` 一致。
+
+```bash
+python train.py --dataset mosi --fusion-gate sample
+python train.py --dataset mosi --lfa-mode selective_null_gain --fusion-gate sample
+```
+
+checkpoint 后缀自动带上模式，例如 `DLF_sample_mosi.pth`、与 gain 组合时
+`DLF_selective_null_gain_sample_mosi.pth`，互不覆盖。启用门控时训练器每 epoch 记录
+门控均值与跨样本标准差（日志 + `result/normal/gate_stats<variant>.csv`）：若 std
+接近 0，说明模型没有真正按样本选择模态。四种模式都应与原版 DLF 在相同数据、种子
+和训练设置下比较 MAE、相关系数及分类指标。

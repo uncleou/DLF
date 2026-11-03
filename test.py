@@ -15,6 +15,11 @@ parser.add_argument(
     choices=['original', 'none', 'atp', 'sent', 'atp_sent', 'original_atp_sent'],
     default='original'
 )
+parser.add_argument(
+    '--fusion-gate',
+    choices=['none', 'fixed', 'global', 'sample'],
+    default='none'
+)
 args = parser.parse_args()
 
 DLF_run(
@@ -22,6 +27,7 @@ DLF_run(
     config={
         'lfa_mode': args.lfa_mode,
         'shared_loss_mode': args.shared_loss_mode,
+        'fusion_gate_mode': args.fusion_gate,
     },
     is_tune=False, seeds=[1111], model_save_dir='./pt', res_save_dir='./result',
     log_dir='./log', mode='test', is_training=False

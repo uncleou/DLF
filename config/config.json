@@ -46,6 +46,8 @@
       "use_bert": true,
       "use_finetune": true,
       "lfa_mode": "original",
+      "fusion_gate_mode": "none",
+      "fusion_gate_init": 0.9,
       "attn_mask": true,
       "update_epochs": 10,
       "shared_loss_mode": "original",

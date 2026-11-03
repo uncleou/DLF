@@ -1,6 +1,8 @@
 """
 here is the mian backbone for DLF
 """
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -44,7 +46,19 @@ class DLF(nn.Module):
                 f"Unknown lfa_mode={self.lfa_mode!r}; expected 'original', "
                 "'selective_null' or 'selective_null_gain'."
             )
-        combined_dim_low = self.d_a    
+        self.fusion_gate_mode = getattr(args, 'fusion_gate_mode', 'none')
+        if self.fusion_gate_mode not in {'none', 'fixed', 'global', 'sample'}:
+            raise ValueError(
+                f"Unknown fusion_gate_mode={self.fusion_gate_mode!r}; expected "
+                "'none', 'fixed', 'global' or 'sample'."
+            )
+        self.fusion_gate_init = float(getattr(args, 'fusion_gate_init', 0.9))
+        if not 0.0 < self.fusion_gate_init < 1.0:
+            raise ValueError(
+                f"fusion_gate_init must be in (0, 1), got {self.fusion_gate_init}."
+            )
+        gate_bias = math.log(self.fusion_gate_init / (1.0 - self.fusion_gate_init))
+        combined_dim_low = self.d_a
         combined_dim_high = self.d_a 
         combined_dim = (self.d_l + self.d_a + self.d_v ) + self.d_l * 3  
         
@@ -133,7 +147,22 @@ class DLF(nn.Module):
         self.projector_v = nn.Linear(self.d_v, self.d_v)
         self.projector_a = nn.Linear(self.d_a, self.d_a)
         self.projector_c = nn.Linear(3 * self.d_l, 3 * self.d_l)
-        
+
+        # 7b. per-sample scalar gates on the audio / video fusion branches
+        self.gate_a = None
+        self.gate_v = None
+        self.gate_a_global = None
+        self.gate_v_global = None
+        if self.fusion_gate_mode == 'sample':
+            self.gate_a = nn.Linear(2 * self.d_l, 1)
+            self.gate_v = nn.Linear(2 * self.d_l, 1)
+            for gate in (self.gate_a, self.gate_v):
+                nn.init.zeros_(gate.weight)
+                nn.init.constant_(gate.bias, gate_bias)
+        elif self.fusion_gate_mode == 'global':
+            self.gate_a_global = nn.Parameter(torch.tensor(gate_bias))
+            self.gate_v_global = nn.Parameter(torch.tensor(gate_bias))
+
         # 8. final project
         self.proj1 = nn.Linear(combined_dim, combined_dim)
         self.proj2 = nn.Linear(combined_dim, combined_dim)
@@ -180,6 +209,28 @@ class DLF(nn.Module):
                       p=self.output_dropout, training=self.training))
         hs_proj += last_h
         return out_layer(hs_proj), hs_proj
+
+    def _gate_audio(self, h_l, h_a):
+        """Scalar audio gate with shape [B, 1], or None when gates are disabled."""
+        if self.fusion_gate_mode == 'none':
+            return None
+        if self.fusion_gate_mode == 'fixed':
+            return torch.full((h_l.size(0), 1), self.fusion_gate_init,
+                              device=h_l.device, dtype=h_l.dtype)
+        if self.fusion_gate_mode == 'global':
+            return torch.sigmoid(self.gate_a_global).expand(h_l.size(0), 1)
+        return torch.sigmoid(self.gate_a(torch.cat([h_l, h_a], dim=1)))
+
+    def _gate_video(self, h_l, h_v):
+        """Scalar video gate with shape [B, 1], or None when gates are disabled."""
+        if self.fusion_gate_mode == 'none':
+            return None
+        if self.fusion_gate_mode == 'fixed':
+            return torch.full((h_l.size(0), 1), self.fusion_gate_init,
+                              device=h_l.device, dtype=h_l.dtype)
+        if self.fusion_gate_mode == 'global':
+            return torch.sigmoid(self.gate_v_global).expand(h_l.size(0), 1)
+        return torch.sigmoid(self.gate_v(torch.cat([h_l, h_v], dim=1)))
 
     def _fuse_and_predict(self, feat_l, feat_v, feat_a, feat_c):
         """Fuse the four sigmoid-projected branches and predict sentiment."""
@@ -344,6 +395,12 @@ class DLF(nn.Module):
         fuse_a = torch.sigmoid(self.projector_a(hs_proj_a_high))
         fuse_c = torch.sigmoid(self.projector_c(c_fusion))
 
+        gate_a = self._gate_audio(hs_proj_l_high, hs_proj_a_high)
+        gate_v = self._gate_video(hs_proj_l_high, hs_proj_v_high)
+        if gate_a is not None:
+            fuse_v = gate_v * fuse_v
+            fuse_a = gate_a * fuse_a
+
         output = self._fuse_and_predict(fuse_l, fuse_v, fuse_a, fuse_c)
 
         #counterfactual branches (training-only, no extra inference cost)
@@ -364,6 +421,9 @@ class DLF(nn.Module):
                 last_h_a_null, self.proj1_a_high, self.proj2_a_high, self.out_layer_a_high
             )
             fuse_a_null = torch.sigmoid(self.projector_a(hs_proj_a_null))
+            gate_a_null = self._gate_audio(hs_proj_l_high, hs_proj_a_null)
+            if gate_a_null is not None:
+                fuse_a_null = gate_a_null * fuse_a_null
             pred_a_null = self._fuse_and_predict(fuse_l, fuse_v, fuse_a_null, fuse_c)
 
             # Force only the V->L path to read Null; shared branch unchanged.
@@ -376,6 +436,9 @@ class DLF(nn.Module):
                 last_h_v_null, self.proj1_v_high, self.proj2_v_high, self.out_layer_v_high
             )
             fuse_v_null = torch.sigmoid(self.projector_v(hs_proj_v_null))
+            gate_v_null = self._gate_video(hs_proj_l_high, hs_proj_v_null)
+            if gate_v_null is not None:
+                fuse_v_null = gate_v_null * fuse_v_null
             pred_v_null = self._fuse_and_predict(fuse_l, fuse_v_null, fuse_a, fuse_c)
 
         res = {
@@ -405,6 +468,8 @@ class DLF(nn.Module):
             'null_attn_a': null_attn_a,
             'null_attn_v': null_attn_v,
             'output_logit_a_null': pred_a_null,
-            'output_logit_v_null': pred_v_null
+            'output_logit_v_null': pred_v_null,
+            'fusion_gate_a': gate_a.detach() if gate_a is not None else None,
+            'fusion_gate_v': gate_v.detach() if gate_v is not None else None,
         }
         return res

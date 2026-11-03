@@ -92,11 +92,14 @@ def DLF_run(
         args.update(config)
     lfa_mode = getattr(args, 'lfa_mode', 'original')
     shared_loss_mode = getattr(args, 'shared_loss_mode', 'original')
+    fusion_gate_mode = getattr(args, 'fusion_gate_mode', 'none')
     variant_parts = []
     if shared_loss_mode != 'original':
         variant_parts.append(shared_loss_mode)
     if lfa_mode != 'original':
         variant_parts.append(lfa_mode)
+    if fusion_gate_mode != 'none':
+        variant_parts.append(fusion_gate_mode)
     variant_suffix = f"_{'_'.join(variant_parts)}" if variant_parts else ''
     checkpoint_name = (
         f"DLF{dataset_name}.pth" if not variant_parts
@@ -109,6 +112,7 @@ def DLF_run(
 
     res_save_dir = Path(res_save_dir) / "normal"
     res_save_dir.mkdir(parents=True, exist_ok=True)
+    args['res_save_dir'] = str(res_save_dir)
     model_results = []
     for i, seed in enumerate(seeds):
         setup_seed(seed)

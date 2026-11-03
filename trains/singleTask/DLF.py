@@ -1,4 +1,7 @@
+import csv
 import logging
+from pathlib import Path
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -46,6 +49,10 @@ class DLF():
         )
         self.lfa_mode = getattr(args, 'lfa_mode', 'original')
         self.use_gain = self.lfa_mode == 'selective_null_gain'
+        self.fusion_gate_mode = getattr(args, 'fusion_gate_mode', 'none')
+        self.track_fusion_gate = self.fusion_gate_mode != 'none'
+        if self.track_fusion_gate:
+            logger.info("Fusion gate: mode=%s", self.fusion_gate_mode)
         self.use_null = self.lfa_mode in {'selective_null', 'selective_null_gain'}
         # Null gate is held closed for this many epochs, then released.
         self.null_warmup_epochs = getattr(args, 'null_warmup_epochs', 5)
@@ -97,6 +104,18 @@ class DLF():
             teacher = EMATeacher(model[0], decay=self.gain_ema_decay).to(self.args.device)
 
         gain_totals = {'gain_a': 0.0, 'gain_v': 0.0, 'loss_gain': 0.0}
+
+        gate_totals = {'sum_a': 0.0, 'sumsq_a': 0.0,
+                       'sum_v': 0.0, 'sumsq_v': 0.0, 'n': 0}
+        gate_csv = None
+        if self.track_fusion_gate:
+            stats_dir = Path(getattr(self.args, 'res_save_dir', '.'))
+            stats_dir.mkdir(parents=True, exist_ok=True)
+            gate_csv = stats_dir / f"gate_stats{self.args.variant_suffix}.csv"
+            with open(gate_csv, 'w', newline='') as f:
+                csv.writer(f).writerow(
+                    ['epoch', 'mean_a', 'std_a', 'mean_v', 'std_v']
+                )
 
         while True:
             epochs += 1
@@ -234,6 +253,19 @@ class DLF():
                             gain_totals['gain_v'] += gain_v.mean().item()
                             gain_totals['loss_gain'] += loss_gain.item()
 
+                    if self.track_fusion_gate:
+                        with torch.no_grad():
+                            for key, tag in (('fusion_gate_a', 'a'),
+                                             ('fusion_gate_v', 'v')):
+                                g = output.get(key)
+                                if g is None:
+                                    continue
+                                g = g.double()
+                                gate_totals[f'sum_{tag}'] += g.sum().item()
+                                gate_totals[f'sumsq_{tag}'] += g.pow(2).sum().item()
+                            n_gate = output['fusion_gate_a'].shape[0]
+                            gate_totals['n'] += n_gate
+
                     y_pred.append(output['output_logit'].cpu())
                     y_true.append(labels.cpu())
                     if not left_epochs:
@@ -263,6 +295,29 @@ class DLF():
                                  for name, value in gain_totals.items()}),
                 )
                 gain_totals = {'gain_a': 0.0, 'gain_v': 0.0, 'loss_gain': 0.0}
+            if self.track_fusion_gate and gate_totals['n'] > 0:
+                n = gate_totals['n']
+                stats = {}
+                for tag in ('a', 'v'):
+                    mean = gate_totals[f'sum_{tag}'] / n
+                    var = max(gate_totals[f'sumsq_{tag}'] / n - mean ** 2, 0.0)
+                    stats[f'mean_{tag}'] = mean
+                    stats[f'std_{tag}'] = var ** 0.5
+                logger.info(
+                    "Fusion gate (epoch %d): mean_a=%.4f std_a=%.4f "
+                    "mean_v=%.4f std_v=%.4f",
+                    epochs, stats['mean_a'], stats['std_a'],
+                    stats['mean_v'], stats['std_v'],
+                )
+                if gate_csv is not None:
+                    with open(gate_csv, 'a', newline='') as f:
+                        csv.writer(f).writerow([
+                            epochs, f"{stats['mean_a']:.6f}",
+                            f"{stats['std_a']:.6f}", f"{stats['mean_v']:.6f}",
+                            f"{stats['std_v']:.6f}",
+                        ])
+                gate_totals = {'sum_a': 0.0, 'sumsq_a': 0.0,
+                               'sum_v': 0.0, 'sumsq_v': 0.0, 'n': 0}
             pred, true = torch.cat(y_pred), torch.cat(y_true)
             train_results = self.metrics(pred, true)
             logger.info(
