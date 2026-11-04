@@ -13,6 +13,7 @@ from .shared_alignment import SharedAlignmentLoss
 from .gain_supervision import (
     EMATeacher, GainSupervision, gain_weight_for_epoch, per_sample_smooth_l1,
 )
+from .distribution_head import DistributionCriterion, HEAD_MODES
 
 
 logger = logging.getLogger('MMSA')
@@ -30,8 +31,33 @@ class MSE(nn.Module):
 class DLF():
     def __init__(self, args):
         self.args = args
-        self.criterion = nn.L1Loss()           
+        self.criterion = nn.L1Loss()
         self.cosine = nn.CosineEmbeddingLoss()
+        self.head_mode = getattr(args, 'head_mode', 'original')
+        if self.head_mode not in HEAD_MODES:
+            raise ValueError(
+                f"Unknown head_mode={self.head_mode!r}; expected one of {HEAD_MODES}."
+            )
+        self.dist_criterion = None
+        if self.head_mode != 'original':
+            self.dist_criterion = DistributionCriterion(
+                self.head_mode,
+                num_bins=getattr(args, 'head_num_bins', 66),
+                bin_min=getattr(args, 'head_bin_min', -3.3),
+                bin_max=getattr(args, 'head_bin_max', 3.3),
+                sigma=getattr(args, 'head_gauss_sigma', 0.075),
+                ce_weight=getattr(args, 'head_ce_weight', 0.1),
+            )
+            logger.info(
+                "Distribution head: mode=%s, bins=%d, range=[%g, %g], "
+                "sigma=%g, l1=%s, ce=%s (weight=%g)",
+                self.head_mode, getattr(args, 'head_num_bins', 66),
+                getattr(args, 'head_bin_min', -3.3),
+                getattr(args, 'head_bin_max', 3.3),
+                getattr(args, 'head_gauss_sigma', 0.075),
+                self.dist_criterion.use_l1, self.dist_criterion.use_ce,
+                self.dist_criterion.ce_weight,
+            )
         self.metrics = MetricsTop(args.train_mode).getMetics(args.dataset_name)
         self.MSE = MSE()
         self.shared_alignment = SharedAlignmentLoss(
@@ -144,6 +170,8 @@ class DLF():
 
             train_loss = 0.0
             shared_loss_totals = dict.fromkeys(('atp', 'sent', 'triplet', 'total'), 0.0)
+            head_totals = ({'l1': 0.0, 'ce': 0.0, 'entropy': 0.0, 'bin_acc': 0.0}
+                           if self.dist_criterion is not None else None)
             left_epochs = self.args.update_epochs
             with tqdm(dataloader['train']) as td:
                 for batch_data in td:
@@ -162,7 +190,16 @@ class DLF():
                     output = model[0](text, audio, vision) 
 
                     # task loss
-                    loss_task_all = self.criterion(output['output_logit'], labels)
+                    if self.dist_criterion is None:
+                        loss_task_all = self.criterion(output['output_logit'], labels)
+                        diagnostic = None
+                    else:
+                        # Main-head objective per head_mode (L1 / CE / both).
+                        main = self.dist_criterion(
+                            output['output_logit'], output['output_bin_logits'], labels
+                        )
+                        loss_task_all = main['total']
+                        diagnostic = main
                     
                     loss_task_l_hetero = self.criterion(output['logits_l_hetero'], labels)  
                     loss_task_v_hetero = self.criterion(output['logits_v_hetero'], labels)
@@ -247,6 +284,26 @@ class DLF():
                     for name in shared_loss_totals:
                         shared_loss_totals[name] += shared_losses[name].detach().item()
 
+                    if head_totals is not None:
+                        with torch.no_grad():
+                            probs = output['output_probs']
+                            head_totals['l1'] += diagnostic['l1'].item()
+                            if diagnostic['ce'] is not None:
+                                head_totals['ce'] += diagnostic['ce'].item()
+                            head_totals['entropy'] += (
+                                -(probs * probs.clamp_min(1e-12).log())
+                                .sum(dim=-1).mean().item()
+                            )
+                            pred_bin = probs.argmax(dim=-1)
+                            centers = self.dist_criterion.centers.to(
+                                device=labels.device, dtype=labels.dtype
+                            )
+                            true_bin = (labels.reshape(-1, 1)
+                                        - centers.reshape(1, -1)).abs().argmin(dim=-1)
+                            head_totals['bin_acc'] += (
+                                (pred_bin == true_bin).float().mean().item()
+                            )
+
                     if self.use_gain:
                         with torch.no_grad():
                             gain_totals['gain_a'] += gain_a.mean().item()
@@ -286,6 +343,14 @@ class DLF():
                 dict_to_str({name: value / len(dataloader['train'])
                              for name, value in shared_loss_totals.items()}),
             )
+            if head_totals is not None:
+                num_batches = len(dataloader['train'])
+                logger.info(
+                    "Distribution head (batch means; ce included in loss=%s): %s",
+                    self.dist_criterion.use_ce,
+                    dict_to_str({name: value / num_batches
+                                 for name, value in head_totals.items()}),
+                )
             if self.use_gain:
                 num_batches = len(dataloader['train'])
                 logger.info(

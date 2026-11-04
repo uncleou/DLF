@@ -20,6 +20,11 @@ parser.add_argument(
     choices=['none', 'fixed', 'global', 'sample'],
     default='none'
 )
+parser.add_argument(
+    '--head-mode',
+    choices=['original', 'dist_l1', 'dist_hard', 'dist_gauss', 'dist_gauss_l1'],
+    default='original'
+)
 args = parser.parse_args()
 
 DLF_run(
@@ -28,6 +33,7 @@ DLF_run(
         'lfa_mode': args.lfa_mode,
         'shared_loss_mode': args.shared_loss_mode,
         'fusion_gate_mode': args.fusion_gate,
+        'head_mode': args.head_mode,
     },
     is_tune=False, seeds=[1111], model_save_dir='./pt', res_save_dir='./result',
     log_dir='./log', mode='train', is_training=True

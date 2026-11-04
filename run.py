@@ -93,11 +93,14 @@ def DLF_run(
     lfa_mode = getattr(args, 'lfa_mode', 'original')
     shared_loss_mode = getattr(args, 'shared_loss_mode', 'original')
     fusion_gate_mode = getattr(args, 'fusion_gate_mode', 'none')
+    head_mode = getattr(args, 'head_mode', 'original')
     lfa_pool_mode = getattr(args, 'lfa_pool_mode', 'last')
     lfa_pool_paths = sorted(getattr(args, 'lfa_pool_paths', []) or [])
     variant_parts = []
     if shared_loss_mode != 'original':
         variant_parts.append(shared_loss_mode)
+    if head_mode != 'original':
+        variant_parts.append(head_mode)
     if lfa_mode != 'original':
         variant_parts.append(lfa_mode)
     if fusion_gate_mode != 'none':
@@ -210,7 +213,17 @@ def _run(args, num_workers=4, is_tune=False, from_sena=False):
 
     #test
     if args.mode == 'test':
-        model.load_state_dict(torch.load(args.checkpoint_path), strict=False)
+        # strict=False would silently keep a random head if head_mode does not
+        # match the checkpoint; surface any key mismatch instead.
+        missing, unexpected = model.load_state_dict(
+            torch.load(args.checkpoint_path), strict=False
+        )
+        if missing or unexpected:
+            raise RuntimeError(
+                f"Checkpoint {args.checkpoint_path} does not match head_mode="
+                f"{getattr(args, 'head_mode', 'original')!r}. "
+                f"missing={missing} unexpected={unexpected}"
+            )
         results = trainer.do_test(model, dataloader['test'], mode="TEST")
         sys.stdout.flush()
         input('[Press Any Key to start another run]')

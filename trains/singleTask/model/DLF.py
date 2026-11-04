@@ -7,7 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ...subNets import BertTextEncoder
-from ...subNets.transformers_encoder.transformer import TransformerEncoder   
+from ...subNets.transformers_encoder.transformer import TransformerEncoder
+from ..distribution_head import HEAD_MODES, DistributionHead
 
 class DLF(nn.Module):
     def __init__(self, args):
@@ -40,6 +41,14 @@ class DLF(nn.Module):
         self.output_dropout = args.output_dropout
         self.text_dropout = args.text_dropout
         self.attn_mask = args.attn_mask
+        self.head_mode = getattr(args, 'head_mode', 'original')
+        if self.head_mode not in HEAD_MODES:
+            raise ValueError(
+                f"Unknown head_mode={self.head_mode!r}; expected one of {HEAD_MODES}."
+            )
+        self.head_num_bins = int(getattr(args, 'head_num_bins', 66))
+        self.head_bin_min = float(getattr(args, 'head_bin_min', -3.3))
+        self.head_bin_max = float(getattr(args, 'head_bin_max', 3.3))
         self.lfa_mode = getattr(args, 'lfa_mode', 'original')
         if self.lfa_mode not in {'original', 'selective_null', 'selective_null_gain'}:
             raise ValueError(
@@ -194,7 +203,15 @@ class DLF(nn.Module):
         # 8. final project
         self.proj1 = nn.Linear(combined_dim, combined_dim)
         self.proj2 = nn.Linear(combined_dim, combined_dim)
-        self.out_layer = nn.Linear(combined_dim, output_dim)
+        if self.head_mode == 'original':
+            self.out_layer = nn.Linear(combined_dim, output_dim)
+            self.dist_head = None
+        else:
+            self.out_layer = None
+            self.dist_head = DistributionHead(
+                combined_dim, self.head_num_bins,
+                self.head_bin_min, self.head_bin_max,
+            )
         
     def get_network(self, self_type='l', layers=-1, selective_null=False):
         if self_type in ['l', 'al', 'vl']:
@@ -325,13 +342,19 @@ class DLF(nn.Module):
         return torch.sigmoid(self.gate_v(torch.cat([h_l, h_v], dim=1)))
 
     def _fuse_and_predict(self, feat_l, feat_v, feat_a, feat_c):
-        """Fuse the four sigmoid-projected branches and predict sentiment."""
+        """Fuse the four sigmoid-projected branches and predict sentiment.
+
+        Returns (y_hat, probs, bin_logits). For head_mode='original' the last
+        two are None and y_hat is the scalar head output, unchanged.
+        """
         last_hs = torch.cat([feat_l, feat_v, feat_a, feat_c], dim=1)
         last_hs_proj = self.proj2(
             F.dropout(F.relu(self.proj1(last_hs), inplace=True),
                       p=self.output_dropout, training=self.training))
         last_hs_proj += last_hs
-        return self.out_layer(last_hs_proj)
+        if self.dist_head is not None:
+            return self.dist_head(last_hs_proj)
+        return self.out_layer(last_hs_proj), None, None
 
     def forward(self, text, audio, video, return_counterfactual=False):
         #extraction
@@ -496,7 +519,9 @@ class DLF(nn.Module):
             fuse_v = gate_v * fuse_v
             fuse_a = gate_a * fuse_a
 
-        output = self._fuse_and_predict(fuse_l, fuse_v, fuse_a, fuse_c)
+        output, output_probs, output_bin_logits = self._fuse_and_predict(
+            fuse_l, fuse_v, fuse_a, fuse_c
+        )
 
         #counterfactual branches (training-only, no extra inference cost)
         pred_a_null = None
@@ -519,7 +544,9 @@ class DLF(nn.Module):
             gate_a_null = self._gate_audio(hs_proj_l_high, hs_proj_a_null)
             if gate_a_null is not None:
                 fuse_a_null = gate_a_null * fuse_a_null
-            pred_a_null = self._fuse_and_predict(fuse_l, fuse_v, fuse_a_null, fuse_c)
+            pred_a_null, _, _ = self._fuse_and_predict(
+                fuse_l, fuse_v, fuse_a_null, fuse_c
+            )
 
             # Force only the V->L path to read Null; shared branch unchanged.
             h_vs_null = self.trans_l_with_v(s_l, s_v, s_v, force_null=True)
@@ -534,7 +561,9 @@ class DLF(nn.Module):
             gate_v_null = self._gate_video(hs_proj_l_high, hs_proj_v_null)
             if gate_v_null is not None:
                 fuse_v_null = gate_v_null * fuse_v_null
-            pred_v_null = self._fuse_and_predict(fuse_l, fuse_v_null, fuse_a, fuse_c)
+            pred_v_null, _, _ = self._fuse_and_predict(
+                fuse_l, fuse_v_null, fuse_a, fuse_c
+            )
 
         res = {
             'origin_l': proj_x_l,
@@ -560,6 +589,8 @@ class DLF(nn.Module):
             'logits_a_hetero': logits_a_high,
             'logits_c': logits_c,
             'output_logit': output,
+            'output_probs': output_probs,
+            'output_bin_logits': output_bin_logits,
             'null_attn_a': null_attn_a,
             'null_attn_v': null_attn_v,
             'output_logit_a_null': pred_a_null,
